@@ -1,0 +1,229 @@
+import os
+import re
+import csv
+import pdfplumber
+import threading
+import tkinter as tk
+from tkinter import filedialog, messagebox
+from tkinter.scrolledtext import ScrolledText
+import sys
+from PIL import Image, ImageTk
+
+
+def extrair_nome_do_titulo(nome_arquivo):
+    nome_sem_extensao, _ = os.path.splitext(nome_arquivo)
+    partes = nome_sem_extensao.split('_')
+    nome_bruto = partes[0] if partes else nome_sem_extensao
+    nome_limpo = re.sub(r'[^a-zA-ZáàâãéèêíïóôõöúçñÁÀÂÃÉÈÊÍÏÓÔÕÖÚÇÑ\s]', ' ', nome_bruto)
+    return " ".join(nome_limpo.split())
+
+def analisar_bloco_proximidade(caminho_pdf):
+    dados = {
+        "cnpj": "Não encontrado",
+        "data_emissao": "Não encontrado",
+        "valor_liquido": "Não encontrado"
+    }
+    
+    with pdfplumber.open(caminho_pdf) as pdf:
+        for pagina in pdf.pages:
+            texto_corrido = pagina.extract_text() or ""
+            
+            # -- Grava o CNPJ
+            if dados["cnpj"] == "Não encontrado":
+                match_cnpj = re.search(r'\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}', texto_corrido)
+                if match_cnpj: 
+                    dados["cnpj"] = match_cnpj.group(0)
+                else:
+                    match_cnpj_puro = re.search(r'\d{14}', texto_corrido)
+                    if match_cnpj_puro:
+                        c = match_cnpj_puro.group(0)
+                        dados["cnpj"] = f"{c[:2]}.{c[2:5]}.{c[5:8]}/{c[8:12]}-{c[12:]}"
+                
+            # -- Gravar data
+            if dados["data_emissao"] == "Não encontrado":
+                match_data = re.search(r'\d{2}/\d{2}/\d{4}', texto_corrido)
+                if match_data: 
+                    dados["data_emissao"] = match_data.group(0)
+
+            # -- Lógica de Ranking para trazer o valor líquido
+            valores_encontrados = re.findall(r'\b\d+(?:\.\d{3})*,\d{2}\b', texto_corrido)
+            mapa_valores = {}
+            
+            for v_str in valores_encontrados:
+                try:
+                    v_float = float(v_str.replace('.', '').replace(',', '.'))
+                    if v_float >= 100.0:
+                        mapa_valores[v_float] = v_str
+                except ValueError:
+                    continue
+            
+            if mapa_valores:
+                valores_unicos_ordenados = sorted(list(mapa_valores.keys()))
+                if len(valores_unicos_ordenados) >= 2:
+                    segundo_maior_float = valores_unicos_ordenados[-2]
+                    dados["valor_liquido"] = mapa_valores[segundo_maior_float]
+                    return dados
+                elif len(valores_unicos_ordenados) == 1:
+                    unico_float = valores_unicos_ordenados[0]
+                    dados["valor_liquido"] = mapa_valores[unico_float]
+                    return dados
+
+    return dados
+
+
+class AplicativoExtrator:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Extrator de PDFs - Painel de Controle")
+        self.root.geometry("640x500")
+        self.root.resizable(True, True)
+                          
+             
+        if hasattr(sys, '_MEIPASS'):
+            self.pasta_base = sys._MEIPASS
+        else:
+            self.pasta_base = os.path.dirname(os.path.abspath(__file__))
+        
+
+        try:
+            caminho_icone = os.path.join(self.pasta_base, 'logo_escreve.ico')
+            img_ico = Image.open(caminho_icone)
+            foto_ico = ImageTk.PhotoImage(img_ico)
+            self.root.wm_iconphoto(True, foto_ico)
+        except Exception:
+            pass
+        
+        # Container superior para botões
+        frame_botoes = tk.Frame(root, pady=15)
+        frame_botoes.pack()
+
+        
+        # Botão Escolher Pasta
+        self.btn_escolher = tk.Button(
+            frame_botoes, text="Escolher Pasta", command=self.iniciar_thread_processamento,
+            width=18, bg="#4CAF50", fg="white", font=("Arial", 10, "bold")
+        )
+        self.btn_escolher.grid(row=0, column=0, padx=10)
+        
+        # Botão para encerrar o programa
+        self.btn_sair = tk.Button(
+            frame_botoes, text="Sair", command=root.quit,
+            width=18, bg="#f44336", fg="white", font=("Arial", 10, "bold")
+        )
+        self.btn_sair.grid(row=0, column=1, padx=10)
+        
+        label_log = tk.Label(root, text="Histórico de Execução (Log):", font=("Arial", 10, "bold"))
+        label_log.pack(anchor="w", padx=15, pady=(5, 0))
+        
+        # --- CONTAINER FLEXÍVEL DO LOG E DO GIF ---
+        frame_conteudo = tk.Frame(root)
+        frame_conteudo.pack(fill="both", expand=True, padx=15, pady=(5, 15))
+        frame_conteudo.grid_rowconfigure(0, weight=1)
+        frame_conteudo.grid_columnconfigure(0, weight=1)
+        
+        # Área de log
+        self.txt_log = ScrolledText(frame_conteudo, height=15, font=("Consolas", 9), bg="#1e1e1e", fg="#d4d4d4")
+        self.txt_log.grid(row=0, column=0, sticky="nsew")
+        
+        # Elemento que receberá o GIF
+        self.lbl_gif = tk.Label(frame_conteudo, bg="#1e1e1e")
+        self.lbl_gif.grid(row=0, column=0, sticky="se", padx=(0, 20), pady=(0, 5)) 
+        
+        # --- CONTROLE E MEMÓRIA DO GIF ---
+        self.frames_gif = []
+        self.frame_index = 0
+        self.gif_rodando = False
+        self.carregar_gif("escreve.gif")
+        
+        self.escrever_log("Sistema inicializado. Pronto para selecionar pastas.\n" + "-"*60)
+
+    def carregar_gif(self, caminho_gif):
+        caminho_absoluto = os.path.join(self.pasta_base, caminho_gif)
+        try:
+            idx = 0
+            while True:
+                quadro = tk.PhotoImage(file=caminho_absoluto, format=f"gif -index {idx}")
+                self.frames_gif.append(quadro)
+                idx += 1
+        except tk.TclError:
+            pass 
+
+    def atualizar_animacao(self):
+        if self.gif_rodando and self.frames_gif:
+            quadro_atual = self.frames_gif[self.frame_index]
+            self.lbl_gif.config(image=quadro_atual)
+            self.frame_index = (self.frame_index + 1) % len(self.frames_gif)
+            self.root.after(1, self.atualizar_animacao)  
+        else:
+            self.lbl_gif.config(image="")
+
+    def escrever_log(self, mensagem):
+        self.txt_log.insert(tk.END, mensagem + "\n")
+        self.txt_log.see(tk.END)
+
+    def iniciar_thread_processamento(self):
+        pasta = filedialog.askdirectory(title="Selecione a pasta com as Notas Fiscais")
+        if not pasta:
+            self.escrever_log("[AVISO] Seleção de pasta cancelada pelo usuário.")
+            return
+            
+        self.btn_escolher.config(state=tk.DISABLED)
+        
+        # Dispara a animação do GIF
+        self.gif_rodando = True
+        self.frame_index = 0
+        self.atualizar_animacao()
+        
+        thread = threading.Thread(target=self.processar_pasta, args=(pasta,), daemon=True)
+        thread.start()
+
+    def processar_pasta(self, pasta_origem):
+        self.escrever_log(f"\n[INÍCIO] Lendo a pasta: {pasta_origem}")
+        
+        caminho_csv_saida = os.path.join(pasta_origem, "dados_extraidos_mister.csv")
+        colunas_csv = ["Nome do Profissional", "CNPJ", "Valor Líquido", "Data de Emissão"]
+        
+        sucessos = 0
+        arquivos = [f for f in os.listdir(pasta_origem) if f.lower().endswith('.pdf')]
+        
+        if not arquivos:
+            self.escrever_log("[ERRO] Nenhum arquivo .pdf foi localizado nesta pasta.")
+            self.btn_escolher.config(state=tk.NORMAL)
+            self.gif_rodando = False
+            return
+
+        with open(caminho_csv_saida, mode='w', encoding='utf-8-sig', newline='') as arquivo_csv:
+            escritor = csv.writer(arquivo_csv, delimiter=';')
+            escritor.writerow(colunas_csv)
+            
+            for arquivo in arquivos:
+                try:
+                    caminho_completo_pdf = os.path.join(pasta_origem, arquivo)
+                    nome_profissional = extrair_nome_do_titulo(arquivo)
+                    
+                    dados_internos = analisar_bloco_proximidade(caminho_completo_pdf)
+                    
+                    escritor.writerow([
+                        nome_profissional,
+                        dados_internos["cnpj"],
+                        dados_internos["valor_liquido"],
+                        dados_internos["data_emissao"]
+                    ])
+                    
+                    self.escrever_log(f" ✔️ Processado: {nome_profissional} | Líquido: {dados_internos['valor_liquido']}")
+                    sucessos += 1
+                except Exception as e:
+                    self.escrever_log(f" ❌ Erro ao ler o arquivo '{arquivo}': {str(e)}")
+
+        self.escrever_log(f"[FIM] Concluído! {sucessos} arquivos processados com sucesso.")
+        self.escrever_log(f"[FIM] Planilha gerada em: {caminho_csv_saida}\n" + "-"*60)
+        
+        # Desliga a animação do GIF ao finalizar
+        self.gif_rodando = False
+        self.btn_escolher.config(state=tk.NORMAL)
+        messagebox.showinfo("Sucesso", f"Processamento concluído!\n{sucessos} arquivos adicionados ao CSV.")
+
+if __name__ == "__main__":
+    janela_principal = tk.Tk()
+    app = AplicativoExtrator(janela_principal)
+    janela_principal.mainloop()
